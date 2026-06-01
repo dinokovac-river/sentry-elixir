@@ -54,6 +54,15 @@ defmodule Sentry.Scrubber do
       `default_private_allow_list/0` and the `:private_allow_list` option of
       `put_conn_scrubber/1`), dropping everything else.
 
+  By default `scrub/1` redacts `cookies`, `req_headers`, and `params` (the
+  configurable fields), clears `req_cookies` and `assigns` to `%{}`, scrubs
+  `body_params` and `query_params` as params-shaped maps, and reduces `private`
+  to its allow-listed keys (`default_private_allow_list/0`). `assigns` is cleared
+  wholesale because auth libraries (Guardian, Pow, Coherence) routinely store
+  decoded tokens, full user structs, and session data there, where no key-based
+  heuristic redacts safely. `private` keeps only the allow-listed framework
+  metadata and drops everything else (notably `:plug_session`).
+
   The defaults can be overridden per call with `scrub(conn, overrides)`, where
   `overrides` is a `field: strategy` keyword list merged over the attribute —
   for example `scrub(conn, assigns: :clear)`. The request URL is not a conn
@@ -91,12 +100,25 @@ defmodule Sentry.Scrubber do
   # Default `field -> strategy` mapping applied by `scrub/1` (overridable per
   # call via `scrub(conn, overrides)`). A strategy is either a configurable
   # scrubber struct-key (resolved per process via `get/1`) or a fixed tag:
-  # `:clear` -> `%{}`, `:params` -> params-shaped scrub (Unfetched-safe).
+  # `:clear` -> `%{}`, `:params` -> params-shaped scrub (Unfetched-safe),
+  # `:private_allow_list` -> keep only the registered allow-listed keys.
   # Add an entry to make a new conn field scrubbed by default.
+  #
+  # `assigns` is cleared wholesale because auth libraries (Guardian, Pow,
+  # Coherence) routinely store decoded tokens, full user structs, and session
+  # data there — there is no reliable key-based heuristic to redact it safely.
+  # `private` mixes sensitive data (e.g. `:plug_session`) with high-signal
+  # framework metadata (Phoenix routing), so it uses an allow-list instead of
+  # clearing wholesale — see `@default_private_allow_list`.
   @scrubbable_conn_fields [
     cookies: :cookie_scrubber,
+    req_cookies: :clear,
     req_headers: :header_scrubber,
-    params: :body_scrubber
+    params: :body_scrubber,
+    body_params: :params,
+    query_params: :params,
+    assigns: :clear,
+    private: :private_allow_list
   ]
 
   @typedoc """

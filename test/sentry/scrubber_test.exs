@@ -146,45 +146,128 @@ defmodule Sentry.ScrubberTest do
   describe "scrub/1 with no registered scrubber" do
     setup do
       conn = %Plug.Conn{
-        cookies: %{"session" => "secret-session"},
+        # `Plug.Conn.fetch_cookies/2` parses incoming Cookie headers into both
+        # `cookies` and `req_cookies`. Apps using Plug.Session also see the
+        # encoded session cookie here.
+        cookies: %{
+          "_my_app_session" => "SFMyNTY.g3QAAAACbQAAAAtfY3Nyb..."
+        },
+        req_cookies: %{
+          "_my_app_session" => "SFMyNTY.g3QAAAACbQAAAAtfY3Nyb...",
+          "user_remember_me" => "abc123-remember-token"
+        },
         req_headers: [
-          {"Authorization", "Bearer secret-token"},
-          {"cookie", "session=secret-session"},
-          {"x-request-id", "abc-123"}
+          {"authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature"},
+          {"cookie", "_my_app_session=...; user_remember_me=abc123"},
+          {"x-request-id", "req-abc-123"}
         ],
-        params: %{"password" => "hunter2", "name" => "Alice"}
+        params: %{
+          "user" => %{"email" => "alice@example.com", "password" => "hunter2"},
+          "_csrf_token" => "csrf-leaky-token"
+        },
+        body_params: %{
+          "user" => %{"email" => "alice@example.com", "password" => "hunter2"}
+        },
+        query_params: %{
+          "redirect_to" => "/dashboard",
+          "secret" => "password-reset-token-xyz"
+        },
+        # Guardian.Plug.LoadResource and custom auth plugs put the loaded user
+        # struct here. Pow uses conn.assigns[:current_user] by default.
+        assigns: %{
+          current_user: %{
+            id: 1,
+            email: "alice@example.com",
+            password_hash: "$2b$12$leaky.bcrypt.hash.value.here"
+          },
+          jwt_claims: %{"sub" => "1", "exp" => 1_700_000_000, "secret" => "claim-secret"}
+        },
+        # Guardian stores the raw JWT and decoded claims here. Plug.Session
+        # puts the session data here. Phoenix populates its own routing /
+        # dispatch metadata here.
+        private: %{
+          guardian_default_token: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+          guardian_default_claims: %{"sub" => "1", "exp" => 1_700_000_000},
+          plug_session: %{"user_id" => 1, "_csrf_token" => "csrf-token-xyz"},
+          phoenix_endpoint: SomeApp.Endpoint,
+          phoenix_controller: SomeApp.PageController
+        },
+        request_path: "/users",
+        method: "POST"
       }
 
       %{conn: conn, scrubbed: Scrubber.scrub(conn)}
     end
 
-    test "clears cookies", %{scrubbed: scrubbed} do
+    test "clears cookies and req_cookies", %{scrubbed: scrubbed} do
       assert scrubbed.cookies == %{}
+      assert scrubbed.req_cookies == %{}
     end
 
     test "drops sensitive req_headers case-insensitively and keeps list shape",
          %{scrubbed: scrubbed} do
-      assert scrubbed.req_headers == [{"x-request-id", "abc-123"}]
+      assert scrubbed.req_headers == [{"x-request-id", "req-abc-123"}]
       assert is_list(scrubbed.req_headers)
     end
 
-    test "scrubs params", %{scrubbed: scrubbed} do
-      assert scrubbed.params == %{"password" => "*********", "name" => "Alice"}
+    test "scrubs params with default sensitive keys", %{scrubbed: scrubbed} do
+      assert scrubbed.params == %{
+               "user" => %{"email" => "alice@example.com", "password" => "*********"},
+               "_csrf_token" => "csrf-leaky-token"
+             }
+    end
+
+    test "scrubs body_params with default sensitive keys", %{scrubbed: scrubbed} do
+      assert scrubbed.body_params == %{
+               "user" => %{"email" => "alice@example.com", "password" => "*********"}
+             }
+    end
+
+    test "scrubs query_params with default sensitive keys", %{scrubbed: scrubbed} do
+      assert scrubbed.query_params == %{
+               "redirect_to" => "/dashboard",
+               "secret" => "*********"
+             }
+    end
+
+    test "clears assigns wholesale", %{scrubbed: scrubbed} do
+      # Auth libraries put current_user + password_hash + JWT claims here.
+      # No reliable key-based heuristic — clear the whole map.
+      assert scrubbed.assigns == %{}
+    end
+
+    test "reduces private to the allow-listed framework metadata", %{scrubbed: scrubbed} do
+      # Phoenix routing metadata is retained (high-signal for triage); Guardian
+      # tokens and the decoded Plug.Session payload are dropped.
+      assert scrubbed.private == %{
+               phoenix_endpoint: SomeApp.Endpoint,
+               phoenix_controller: SomeApp.PageController
+             }
+
+      refute Map.has_key?(scrubbed.private, :plug_session)
+      refute Map.has_key?(scrubbed.private, :guardian_default_token)
+      refute Map.has_key?(scrubbed.private, :guardian_default_claims)
+    end
+
+    test "preserves non-sensitive fields", %{scrubbed: scrubbed} do
+      assert scrubbed.request_path == "/users"
+      assert scrubbed.method == "POST"
     end
 
     test "returns a %Plug.Conn{} struct", %{scrubbed: scrubbed} do
       assert is_struct(scrubbed, Plug.Conn)
     end
 
-    test "rewrites only cookies, req_headers, and params", %{conn: conn, scrubbed: scrubbed} do
-      changed =
-        conn
-        |> Map.from_struct()
-        |> Enum.filter(fn {key, value} -> Map.fetch!(scrubbed, key) != value end)
-        |> Enum.map(fn {key, _value} -> key end)
-        |> Enum.sort()
+    test "leaves %Plug.Conn.Unfetched{} body_params/query_params alone" do
+      conn = %Plug.Conn{
+        body_params: %Plug.Conn.Unfetched{aspect: :body_params},
+        query_params: %Plug.Conn.Unfetched{aspect: :query_params}
+      }
 
-      assert changed == [:cookies, :params, :req_headers]
+      scrubbed = Scrubber.scrub(conn)
+
+      assert scrubbed.body_params == %Plug.Conn.Unfetched{aspect: :body_params}
+      assert scrubbed.query_params == %Plug.Conn.Unfetched{aspect: :query_params}
     end
   end
 
