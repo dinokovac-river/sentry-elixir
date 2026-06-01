@@ -122,6 +122,20 @@ defmodule Sentry.ConfigTest do
       end
     end
 
+    test ":scrub_conn_private_allow_list" do
+      assert Config.validate!([])[:scrub_conn_private_allow_list] ==
+               Sentry.Scrubber.default_private_allow_list()
+
+      config = [scrub_conn_private_allow_list: [:phoenix_action, :my_custom_key]]
+
+      assert Config.validate!(config)[:scrub_conn_private_allow_list] ==
+               [:phoenix_action, :my_custom_key]
+
+      assert_raise ArgumentError, ~r/invalid list in :scrub_conn_private_allow_list/, fn ->
+        Config.validate!(scrub_conn_private_allow_list: ["not_an_atom"])
+      end
+    end
+
     # TODO: remove me on v11.0.0. :included_environments has been deprecated in v10.0.0.
     test ":included_environments" do
       output =

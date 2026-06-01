@@ -168,6 +168,123 @@ defmodule Sentry.ScrubberTest do
     end
   end
 
+  describe "scrub/2 with conn field overrides" do
+    test ":clear override replaces additional fields with %{}" do
+      conn = %Plug.Conn{
+        params: %{"password" => "hunter2"},
+        assigns: %{current_user: %{password_hash: "secret"}},
+        private: %{guardian_token: "jwt"}
+      }
+
+      scrubbed = Scrubber.scrub(conn, assigns: :clear, private: :clear)
+
+      # default fields still scrubbed
+      assert scrubbed.params == %{"password" => "*********"}
+      # overridden fields cleared wholesale
+      assert scrubbed.assigns == %{}
+      assert scrubbed.private == %{}
+    end
+
+    test ":params override scrubs the named field by default sensitive keys" do
+      conn = %Plug.Conn{
+        body_params: %{"user" => %{"password" => "hunter2", "email" => "a@b.c"}},
+        query_params: %{"secret" => "leak", "page" => "1"}
+      }
+
+      scrubbed = Scrubber.scrub(conn, body_params: :params, query_params: :params)
+
+      assert scrubbed.body_params == %{
+               "user" => %{"password" => "*********", "email" => "a@b.c"}
+             }
+
+      assert scrubbed.query_params == %{"secret" => "*********", "page" => "1"}
+    end
+
+    test ":params override leaves %Plug.Conn.Unfetched{} untouched" do
+      unfetched = %Plug.Conn.Unfetched{aspect: :body_params}
+      conn = %Plug.Conn{body_params: unfetched}
+
+      scrubbed = Scrubber.scrub(conn, body_params: :params)
+
+      assert scrubbed.body_params == unfetched
+    end
+
+    test "an override can change a default field's strategy" do
+      conn = %Plug.Conn{params: %{"password" => "hunter2", "name" => "Alice"}}
+
+      # default for :params is :body_scrubber (key-based); override to :clear
+      scrubbed = Scrubber.scrub(conn, params: :clear)
+
+      assert scrubbed.params == %{}
+    end
+
+    test "no overrides behaves like scrub/1" do
+      conn = %Plug.Conn{
+        cookies: %{"session" => "secret"},
+        params: %{"password" => "hunter2"}
+      }
+
+      assert Scrubber.scrub(conn, []) == Scrubber.scrub(conn)
+    end
+  end
+
+  describe ":private_allow_list strategy" do
+    setup do
+      conn = %Plug.Conn{
+        private: %{
+          phoenix_controller: SomeApp.PageController,
+          phoenix_action: :show,
+          phoenix_endpoint: SomeApp.Endpoint,
+          phoenix_router: SomeApp.Router,
+          plug_session: %{"user_id" => 1, "token" => "secret"},
+          guardian_default_token: "eyJhbG.signature"
+        }
+      }
+
+      %{conn: conn}
+    end
+
+    test "keeps default-allow-listed routing keys and drops everything else", %{conn: conn} do
+      scrubbed = Scrubber.scrub(conn, private: :private_allow_list)
+
+      assert scrubbed.private == %{
+               phoenix_controller: SomeApp.PageController,
+               phoenix_action: :show,
+               phoenix_endpoint: SomeApp.Endpoint,
+               phoenix_router: SomeApp.Router
+             }
+
+      refute Map.has_key?(scrubbed.private, :plug_session)
+      refute Map.has_key?(scrubbed.private, :guardian_default_token)
+    end
+
+    test "honors a custom private_allow_list registered via put_conn_scrubber/1", %{conn: conn} do
+      :ok = Scrubber.put_conn_scrubber(private_allow_list: [:phoenix_action])
+
+      scrubbed = Scrubber.scrub(conn, private: :private_allow_list)
+
+      assert scrubbed.private == %{phoenix_action: :show}
+    end
+
+    test "an empty allow_list drops all private keys", %{conn: conn} do
+      :ok = Scrubber.put_conn_scrubber(private_allow_list: [])
+
+      scrubbed = Scrubber.scrub(conn, private: :private_allow_list)
+
+      assert scrubbed.private == %{}
+    end
+  end
+
+  describe "default_private_allow_list/0" do
+    test "returns Phoenix routing/render metadata keys" do
+      allow_list = Scrubber.default_private_allow_list()
+
+      assert :phoenix_controller in allow_list
+      assert :phoenix_action in allow_list
+      refute :plug_session in allow_list
+    end
+  end
+
   describe "put_conn_scrubber/1 + scrub/1" do
     test "registered :body_scrubber wins over the default" do
       conn = %Plug.Conn{params: %{"password" => "hunter2"}}
